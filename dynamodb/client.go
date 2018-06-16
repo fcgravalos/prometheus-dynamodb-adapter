@@ -7,18 +7,15 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"github.com/cenkalti/backoff"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
 
-const (
-	dateFormat       = "20060102"
-	dynamodbPutLimit = 25
-)
+const dateFormat = "20060102"
 
 type Client struct {
 	logger    log.Logger
@@ -27,9 +24,6 @@ type Client struct {
 }
 
 type Config struct {
-	/*Region             string
-	AwsAccessKeyId     string
-	AwsSecretAccessKey string*/
 	TableName string
 }
 
@@ -67,76 +61,44 @@ func NewClient(logger log.Logger, tableName string) *Client {
 	}
 }
 
-func (c *Client) sendBatch(writeReqs []*dynamodb.WriteRequest) error {
-	input := &dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]*dynamodb.WriteRequest{
-			fmt.Sprintf("%s", c.tableName): writeReqs,
-		},
+func (c *Client) putSample(sample *model.Sample) error {
+	ts := sample.Timestamp
+	metric := string(sample.Metric[model.MetricNameLabel])
+	r := Record{
+		PartitionId: fmt.Sprintf("%s-%s", metric, ts.Time().Format(dateFormat)),
+		Metric:      metric,
+		Timestamp:   ts.Time(),
+		Labels:      extractLabels(sample.Metric),
+		Value:       fmt.Sprintf("%s", sample.Value),
 	}
-	fmt.Printf("LEN OF WRITEREQS: %v\n", len(writeReqs))
-	output, err := c.client.BatchWriteItem(input)
-
+	mr, err := dynamodbattribute.MarshalMap(r)
 	if err != nil {
-		level.Error(c.logger).Log("msg", "couldn't insert new record into dynamodb table", "err", err)
+		level.Error(c.logger).Log("msg", "couldn't marshall record into dynamodb attribute", "err", err)
 		return err
 	}
-
-	if len(output.UnprocessedItems) > 0 {
-		go func(writeReqs map[string][]*dynamodb.WriteRequest) error {
-			b := backoff.NewExponentialBackOff()
-			b.MaxElapsedTime = 3 * time.Minute
-			operation := func() error {
-				_, err := c.client.BatchWriteItem(input)
-				return err
-			}
-			err = backoff.Retry(operation, b)
-			if err != nil {
-				level.Error(c.logger).Log("msg", "couldn't insert items after retrying", "err", err)
-			}
-			return err
-		}(output.UnprocessedItems)
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(c.tableName),
+		Item:      mr,
+	}
+	_, err = c.client.PutItem(input)
+	if err != nil {
+		level.Error(c.logger).Log("err", "error inserting new record", "err", err)
 	}
 	return err
 }
 
-// Write implements the Writer interface and writes metric samples to DynamoDb table
 func (c *Client) Write(samples model.Samples) error {
-	err := *new(error)
-	writeReqs := make([]*dynamodb.WriteRequest, dynamodbPutLimit)
-	for _, sample := range samples {
-		ts := sample.Timestamp
-		metric := string(sample.Metric[model.MetricNameLabel])
-		r := Record{
-			PartitionId: fmt.Sprintf("%s-%s", metric, ts.Time().Format(dateFormat)),
-			Metric:      metric,
-			Timestamp:   ts.Time(),
-			Labels:      extractLabels(sample.Metric),
-			Value:       fmt.Sprintf("%s", sample.Value),
-		}
-		mr, err := dynamodbattribute.MarshalMap(r)
-		if err != nil {
-			level.Error(c.logger).Log("msg", "couldn't marshall record into dynamodb attribute", "err", err)
-			continue
-		}
-		writeReq := &dynamodb.WriteRequest{
-			PutRequest: &dynamodb.PutRequest{
-				Item: mr,
-			},
+	writeErr := *new(error)
+	putErr := *new(error)
+	for _, s := range samples {
+		putErr = c.putSample(s)
+		if putErr != nil {
+			writeErr = putErr
+			level.Error(c.logger).Log("err", "error inserting new record", "err", putErr)
 		}
 
-		if len(writeReqs)%dynamodbPutLimit == 0 {
-			err = c.sendBatch(writeReqs)
-			writeReqs = nil
-		}
-		writeReqs = append(writeReqs, writeReq)
 	}
-
-	if len(writeReqs) > 0 {
-		fmt.Printf("AAAAQUIIIIIIII: %v\n", len(writeReqs))
-		err = c.sendBatch(writeReqs)
-	}
-
-	return err
+	return writeErr
 }
 
 func (c *Client) Name() string {
